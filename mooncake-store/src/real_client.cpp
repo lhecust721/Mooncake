@@ -32,6 +32,7 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "offload_perf_trace.h"
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -5464,21 +5465,53 @@ RealClient::batch_get_into_offload_object_internal(
         for (const auto &s : object_it.second) total += s.size;
         sizes.emplace_back(total);
     }
+    uint64_t total_bytes = 0;
+    for (const auto size : sizes) {
+        if (size > 0) total_bytes += static_cast<uint64_t>(size);
+    }
+
+    const auto rpc_start = std::chrono::steady_clock::now();
     auto batchGetResp = client_requester_->batch_get_offload_object(
         target_rpc_service_addr, keys, sizes);
+    const auto rpc_end = std::chrono::steady_clock::now();
     if (!batchGetResp) {
+        offload_perf::LogDuration(
+            "ssd_rpc_wait", 0, keys.size(), total_bytes, rpc_start, rpc_end,
+            false, static_cast<int>(batchGetResp.error()),
+            target_rpc_service_addr);
+        offload_perf::LogDuration(
+            "offload_get_total", 0, keys.size(), total_bytes, start_time,
+            rpc_end, false, static_cast<int>(batchGetResp.error()),
+            target_rpc_service_addr);
         LOG(ERROR) << "Batch get offload object failed with error: "
                    << batchGetResp.error();
         return tl::make_unexpected(batchGetResp.error());
     }
+    offload_perf::LogDuration(
+        "ssd_rpc_wait", batchGetResp->batch_id, keys.size(), total_bytes,
+        rpc_start, rpc_end, true, static_cast<int>(ErrorCode::OK),
+        target_rpc_service_addr);
     if (batchGetResp->pointers.size() != keys.size()) {
+        offload_perf::LogDuration(
+            "offload_get_total", batchGetResp->batch_id, keys.size(),
+            total_bytes, start_time, std::chrono::steady_clock::now(), false,
+            static_cast<int>(ErrorCode::INVALID_PARAMS),
+            target_rpc_service_addr);
         LOG(ERROR) << "Pointer count mismatch from owner: expected="
                    << keys.size() << ", got=" << batchGetResp->pointers.size();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+    const auto hbm_start = std::chrono::steady_clock::now();
     auto result =
         client_->BatchGetOffloadObject(batchGetResp->transfer_engine_addr, keys,
                                        batchGetResp->pointers, objects);
+    const auto hbm_end = std::chrono::steady_clock::now();
+    offload_perf::LogDuration(
+        "staging_to_hbm", batchGetResp->batch_id, keys.size(), total_bytes,
+        hbm_start, hbm_end, result.has_value(),
+        static_cast<int>(result ? ErrorCode::OK : result.error()),
+        target_rpc_service_addr);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
@@ -5495,6 +5528,12 @@ RealClient::batch_get_into_offload_object_internal(
     // This allows early buffer reclamation instead of waiting for GC lease
     client_requester_->release_offload_buffer(target_rpc_service_addr,
                                               batchGetResp->batch_id);
+
+    offload_perf::LogDuration(
+        "offload_get_total", batchGetResp->batch_id, keys.size(), total_bytes,
+        start_time, end_time, result.has_value(),
+        static_cast<int>(result ? ErrorCode::OK : result.error()),
+        target_rpc_service_addr);
 
     if (!result) {
         LOG(ERROR) << "Batch get into offload object failed with error: "

@@ -8,6 +8,7 @@
 #include "client_metric.h"
 #include "utils.h"
 #include "gpu_staging_utils.h"
+#include "offload_perf_trace.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
@@ -300,13 +301,36 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
+    uint64_t total_bytes = 0;
+    for (const auto size : sizes) {
+        if (size > 0) total_bytes += static_cast<uint64_t>(size);
+    }
+
+    const auto allocate_start = std::chrono::steady_clock::now();
     auto allocate_res = AllocateBatch(keys, sizes);
+    const auto allocate_end = std::chrono::steady_clock::now();
     if (!allocate_res) {
+        offload_perf::LogDuration(
+            "owner_allocate_staging", 0, keys.size(), total_bytes,
+            allocate_start, allocate_end, false,
+            static_cast<int>(allocate_res.error()), local_rpc_addr_);
         LOG(ERROR) << "Failed to allocate batch objects";
         return tl::make_unexpected(allocate_res.error());
     }
     auto allocated_batch = allocate_res.value();
+    const uint64_t batch_id = allocated_batch->batch_id;
+    offload_perf::LogDuration("owner_allocate_staging", batch_id, keys.size(),
+                              total_bytes, allocate_start, allocate_end, true,
+                              static_cast<int>(ErrorCode::OK), local_rpc_addr_);
+
+    const auto ssd_start = std::chrono::steady_clock::now();
     auto result = BatchLoad(allocated_batch->slices);
+    const auto ssd_end = std::chrono::steady_clock::now();
+    offload_perf::LogDuration(
+        "ssd_to_staging", batch_id, keys.size(), total_bytes, ssd_start,
+        ssd_end, result.has_value(),
+        static_cast<int>(result ? ErrorCode::OK : result.error()),
+        local_rpc_addr_);
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
         return tl::make_unexpected(result.error());
@@ -323,13 +347,15 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
         }
     }
 
-    uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
 
     MutexLocker locker(&client_buffer_mutex_);
     client_buffer_allocated_batches_.emplace(batch_id,
                                              std::move(allocated_batch));
     auto end_time = std::chrono::steady_clock::now();
+    offload_perf::LogDuration(
+        "owner_batch_get_total", batch_id, keys.size(), total_bytes, start_time,
+        end_time, true, static_cast<int>(ErrorCode::OK), local_rpc_addr_);
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
                             .count();

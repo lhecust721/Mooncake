@@ -48,6 +48,19 @@ if(USE_ASCEND_DIRECT)
                  ${WORKSPACE}/transfer_engine_ascend_direct_perf.cpp)
   target_link_libraries(transfer_engine_ascend_direct_perf
                         PUBLIC ascendcl transfer_engine)
+
+  add_executable(ssd_direct_hbm_probe
+                 ${WORKSPACE}/ssd_direct_hbm_probe.cpp)
+  target_link_libraries(ssd_direct_hbm_probe PUBLIC ascendcl)
+  find_library(LIBURING_LIBRARY uring)
+  find_path(LIBURING_INCLUDE_DIR liburing.h)
+  if(LIBURING_LIBRARY AND LIBURING_INCLUDE_DIR)
+    target_compile_definitions(ssd_direct_hbm_probe
+                               PRIVATE MOONCAKE_DIRECT_PROBE_HAS_URING)
+    target_include_directories(ssd_direct_hbm_probe
+                               PRIVATE ${LIBURING_INCLUDE_DIR})
+    target_link_libraries(ssd_direct_hbm_probe PUBLIC ${LIBURING_LIBRARY})
+  endif()
 endif()
 
 if(USE_ASCEND_HETEROGENEOUS)
