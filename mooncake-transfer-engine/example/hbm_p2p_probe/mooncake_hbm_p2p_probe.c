@@ -199,7 +199,8 @@ static int mooncake_map_for_nvme(
         strscpy(request->nvme_driver, driver_name,
                 sizeof(request->nvme_driver));
 
-    if ((pdev->class >> 8) != PCI_CLASS_STORAGE_EXPRESS) {
+    /* Compare the PCI base class and subclass, excluding prog-if. */
+    if ((pdev->class >> 8) != (PCI_CLASS_STORAGE_EXPRESS >> 8)) {
         request->nvme_device_status = -ENOTBLK;
         request->dma_map_status = -ENOTBLK;
         pci_dev_put(pdev);
