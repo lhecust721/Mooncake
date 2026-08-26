@@ -59,6 +59,12 @@ if(USE_ASCEND_DIRECT)
                              PRIVATE ${WORKSPACE}/hbm_p2p_probe)
   target_link_libraries(hbm_p2p_mapping_probe PUBLIC ascendcl)
 
+  add_executable(nvme_hbm_l2_read_probe
+                 ${WORKSPACE}/nvme_hbm_l2_read_probe.cpp)
+  target_include_directories(nvme_hbm_l2_read_probe
+                             PRIVATE ${WORKSPACE}/hbm_p2p_probe)
+  target_link_libraries(nvme_hbm_l2_read_probe PUBLIC ascendcl)
+
   find_library(LIBURING_LIBRARY uring)
   find_path(LIBURING_INCLUDE_DIR liburing.h)
   if(LIBURING_LIBRARY AND LIBURING_INCLUDE_DIR)

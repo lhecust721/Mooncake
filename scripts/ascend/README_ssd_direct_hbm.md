@@ -141,8 +141,10 @@ Use these levels consistently in reports:
 - **L3 — physical NVMe-to-HBM DMA proven:** L2 plus PCIe/IOMMU/SMMU and runtime
   traces show NVMe DMA targeting HBM with no CPU/FabricMem bounce buffer.
 
-The current standalone probe can automatically reach at most L1. Do not label
-it “A3 Direct Storage” until L2 is established.
+The POSIX/O_DIRECT probe can automatically reach at most L1. The HBM page
+export probe establishes the separate L1.5 mapping gate described below. Do
+not label either result “A3 Direct Storage” until a real read and physical-path
+evidence establish L2/L3.
 
 ## 5. Export real HBM pages and map them for an NVMe PCI device
 
@@ -313,6 +315,105 @@ rmmod mooncake_hbm_p2p_probe
 The next level requires a separately reviewed, controlled NVMe command path,
 content verification, PCIe/ACS/IOMMU evidence, and direct-versus-fallback
 counters. Do not attach that experiment to a mounted production filesystem.
+
+### 5.4 Stability matrix
+
+Run the mapping probe across 1, 4, 16 and 64 MiB ten times each. The matrix
+streams every underlying PASS/FAIL line, prints a compact per-sample verdict,
+and optionally writes JSONL for later comparison:
+
+```bash
+python3 scripts/ascend/run_hbm_p2p_stability_matrix.py \
+  --binary ./build-a3-ssd-direct/mooncake-transfer-engine/example/hbm_p2p_mapping_probe \
+  --module ./mooncake-transfer-engine/example/hbm_p2p_probe/mooncake_hbm_p2p_probe.ko \
+  --device 10 \
+  --nvme-bdf 0000:e0:00.0 \
+  --sizes 1048576,4194304,16777216,67108864 \
+  --iterations 10 \
+  --output artifacts/hbm-p2p-stability.jsonl
+```
+
+Run it with the same privileges and CANN environment as the single-runner.
+Unless `--keep-module` is specified, the matrix unloads the probe only when it
+was not loaded before the matrix started. It never unloads a pre-existing
+module. The final lines are immediately readable:
+
+```text
+MATRIX_SIZE size=4194304 passed=10/10 page_count=2..2 pa_runs=1..2 dma_runs=1..2
+MATRIX_RESULT passed=40/40 status=PASS level=L1_5_NVME_DMA_API_MAPPED
+```
+
+`pa_runs` and `dma_runs` are expected to vary with HBM fragmentation. A direct
+implementation must support the maximum observed scatter/gather shape; it
+must not assume that one `aclrtMalloc` allocation is physically contiguous.
+
+### 5.5 Read-only L2 candidate probe
+
+Build the L2 candidate user program:
+
+```bash
+cmake --build build-a3-ssd-direct \
+  --target nvme_hbm_l2_read_probe -j"$(nproc)"
+```
+
+This program uses one HBM allocation for both gates:
+
+```text
+same aclrtMalloc HBM
+  -> HBM page export + dma_map_resource preflight
+  -> fixed NVMe READ passthrough command
+  -> HBM-to-host copy and byte-for-byte comparison with a host pread
+```
+
+It hard-codes the read opcode, opens only an NVMe namespace block device with
+`O_RDONLY`, validates its capacity and logical block size, and limits one
+command to at most 64 MiB/65536 logical blocks. There is no write, format,
+discard, reservation or controller-admin path. Partition device nodes are
+rejected because NVMe passthrough SLBA is namespace-relative; the program also
+verifies through sysfs that the whole namespace belongs to `--nvme-bdf`.
+Namespaces with device-mapper/RAID holders are also refused by default.
+
+Use an unmounted test namespace when possible:
+
+```bash
+./build-a3-ssd-direct/mooncake-transfer-engine/example/nvme_hbm_l2_read_probe \
+  --namespace /dev/nvme2n1 \
+  --nvme-bdf 0000:e0:00.0 \
+  --slba 0 \
+  --size 4096 \
+  --device 10
+```
+
+The program refuses a namespace mounted in its current mount namespace. A
+fixed read against a mounted namespace can be requested explicitly, but the
+target range must be quiescent or the host-reference comparison can race live
+writes:
+
+```bash
+./build-a3-ssd-direct/mooncake-transfer-engine/example/nvme_hbm_l2_read_probe \
+  --namespace /dev/nvme2n1 \
+  --nvme-bdf 0000:e0:00.0 \
+  --slba 0 --size 4096 --device 10 \
+  --allow-mounted-read
+```
+
+Interpret the final level conservatively:
+
+- `L2_CANDIDATE_NVME_READ_VERIFIED`: the fixed NVMe read accepted the same HBM
+  allocation that passed the DMA preflight, and copied-back content matched;
+- `L2_BLOCKED_USER_BUFFER_MAPPING` with `errno=14`: Linux's standard NVMe
+  passthrough/user-page mapping rejected the HBM VA before data transfer;
+- `L2_CANDIDATE_NOT_VERIFIED`: another ioctl, controller, range, timeout or
+  content-verification failure occurred.
+
+Even `L2_CANDIDATE_NVME_READ_VERIFIED` is not yet physical-P2P proof. Standard
+Linux NVMe passthrough maps user buffers through the block layer; without
+direct/fallback counters or PCIe/IOMMU tracing, successful content validation
+cannot exclude driver-internal staging. The inspected public CANN driver
+`master` commit `6db2de25c2014af3ec8bf7ae40e6782869513a3b` exposes HBM page
+export but no public NVMe read-submission API that consumes the resulting
+external DMA addresses. A private `ascend_trs_nvme_chan` module name alone is
+not an ABI and must not be called by guessing its function signatures.
 
 ## 6. GDS-style benchmark matrix
 

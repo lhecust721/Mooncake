@@ -185,6 +185,8 @@ build-a3-ssd-direct/mooncake-transfer-engine/example/ssd_direct_hbm_probe
 ```bash
 cmake --build build-a3-ssd-direct \
   --target ssd_direct_hbm_probe \
+           hbm_p2p_mapping_probe \
+           nvme_hbm_l2_read_probe \
   -j"$(nproc)"
 ```
 
