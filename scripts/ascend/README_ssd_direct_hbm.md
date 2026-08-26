@@ -144,7 +144,169 @@ Use these levels consistently in reports:
 The current standalone probe can automatically reach at most L1. Do not label
 it “A3 Direct Storage” until L2 is established.
 
-## 5. GDS-style benchmark matrix
+## 5. Export real HBM pages and map them for an NVMe PCI device
+
+The second probe crosses two additional kernel-facing gates without issuing an
+NVMe command:
+
+```text
+aclrtMalloc HBM in the user process
+        -> ioctl from the same TGID
+        -> hal_kernel_p2p_get_pages
+        -> HBM physical-page table
+        -> dma_map_resource(NVMe struct device, DMA_FROM_DEVICE)
+        -> immediately dma_unmap_resource + hal_kernel_p2p_put_pages
+```
+
+It is intentionally split into a GPL kernel module and an ACL user program.
+The module performs no file I/O, submits no NVMe command, changes no block
+device state, and retains neither HBM pages nor DMA mappings after the ioctl.
+The default allocation is 4 MiB and the module rejects allocations above 256
+MiB.
+
+### 5.1 Prerequisites and offline build
+
+Build the user program through the existing A3 build directory:
+
+```bash
+cmake --build build-a3-ssd-direct --target hbm_p2p_mapping_probe -j
+```
+
+The kernel module must be built for the exact running host kernel. A container
+that has no `/lib/modules/$(uname -r)/build` cannot build or load it merely by
+installing `kmod`. Build on the host, or read-only mount the matching kernel
+headers and modules into the container.
+
+```bash
+cd mooncake-transfer-engine/example/hbm_p2p_probe
+
+# If CONFIG_MODVERSIONS is enabled, point this at the Module.symvers produced
+# by the matching CANN/Ascend driver build so the GPL symbol CRCs are correct.
+make \
+  KDIR=/lib/modules/$(uname -r)/build \
+  ASCEND_SYMVERS=/path/to/cann-driver/Module.symvers
+```
+
+Search only local installation/build trees when the exact path is unknown:
+
+```bash
+find /usr/local/Ascend /usr/src /lib/modules/$(uname -r) \
+  -name Module.symvers -type f -print 2>/dev/null
+```
+
+Use the file from the build that produced the running `drv_devmm_host`, not an
+arbitrary kernel or newer CANN tree.
+
+The installed driver already passes the export prerequisite when the following
+symbols are visible:
+
+```bash
+grep -E '(__ksymtab|__kstrtab).*hal_kernel_p2p_(get|put)_pages' \
+  /proc/kallsyms
+```
+
+Load the diagnostic module on the host. This requires `CAP_SYS_MODULE`; running
+the probe device requires `CAP_SYS_RAWIO`.
+
+```bash
+insmod ./mooncake_hbm_p2p_probe.ko
+test -c /dev/mooncake_hbm_p2p_probe && \
+  echo 'PASS: /dev/mooncake_hbm_p2p_probe is ready'
+```
+
+If `insmod` reports `Unknown symbol`, do not bypass module-version checks.
+Rebuild against the exact host kernel and the matching Ascend
+`Module.symvers`. No network access is required once those local build inputs
+are present.
+
+### 5.2 Choose the exact NVMe controller BDF
+
+For the controller that owns `/dev/nvme2n1`, for example:
+
+```bash
+nvme_bdf=$(basename "$(readlink -f /sys/class/nvme/nvme2/device)")
+echo "NVME_BDF=${nvme_bdf}"
+cat "/sys/bus/pci/devices/${nvme_bdf}/class"
+readlink -f "/sys/bus/pci/devices/${nvme_bdf}/driver"
+```
+
+The PCI class must be `0x010802` or another class whose base/subclass is
+`0x0108` (NVM Express). The kernel probe rejects a BDF that is not an NVMe
+controller.
+
+### 5.3 Run with immediate terminal verdicts
+
+First isolate HBM page export if desired:
+
+```bash
+./build-a3-ssd-direct/mooncake-transfer-engine/example/hbm_p2p_mapping_probe \
+  --device 0 --size 4194304 --export-only
+```
+
+Then test NVMe-device DMA mapping:
+
+```bash
+./build-a3-ssd-direct/mooncake-transfer-engine/example/hbm_p2p_mapping_probe \
+  --device 0 \
+  --size 4194304 \
+  --nvme-bdf "${nvme_bdf}"
+```
+
+For a single self-contained run that performs preflight checks, loads the local
+module, streams the verdicts, and unloads only a module that it loaded itself:
+
+```bash
+bash scripts/ascend/run_hbm_p2p_mapping_probe.sh \
+  --binary ./build-a3-ssd-direct/mooncake-transfer-engine/example/hbm_p2p_mapping_probe \
+  --module ./mooncake-transfer-engine/example/hbm_p2p_probe/mooncake_hbm_p2p_probe.ko \
+  --device 0 --size 4194304 --nvme-bdf "${nvme_bdf}"
+```
+
+The runner writes no report file and needs no network access. If udev is not
+available in the container, it temporarily creates the misc-device node from
+`/sys/class/misc/.../dev` and removes only that node during cleanup. Use
+`--keep-module` to leave a module loaded by the runner in place.
+
+Every stage prints one immediately readable line:
+
+```text
+[PASS] hbm_page_export: ... page_size=... page_count=... first_pa=...
+[PASS] nvme_device: ... class=0x010802 driver=nvme dma_mask=...
+[PASS] nvme_dma_api_map: ... mapped=N/N first_iova=...
+[PASS] hbm_page_release: status=0
+[INFO] proof_boundary: ...
+RESULT hbm_export=PASS nvme_device=PASS nvme_dma_api_map=PASS \
+  pages_released=PASS peer_dma=NOT_PROVEN nvme_prp_sgl=NOT_TESTED \
+  physical_nvme_dma_to_hbm=NOT_PROVEN level=L1_5_NVME_DMA_API_MAPPED
+```
+
+Interpret the exit code together with the final `RESULT` line:
+
+- `0`: every requested mapping/export check passed and pages were released;
+- `2`: invalid command-line argument or alignment;
+- `3`: ACL/HBM setup failed;
+- `4`: the probe device/ioctl was unavailable, including missing capability;
+- `5`: HBM page export failed;
+- `6`: exported HBM pages could not be released cleanly;
+- `7`: the NVMe BDF or DMA API mapping check failed.
+
+`nvme_dma_api_map=PASS` means that Linux's DMA API produced addresses in the
+selected NVMe device's DMA domain for every exported HBM page. It does **not**
+prove that the NVMe controller can physically reach those addresses. This
+probe deliberately does not create PRP/SGL entries and does not issue a read,
+so the established level is named `L1_5_NVME_DMA_API_MAPPED`, not L2.
+
+After testing:
+
+```bash
+rmmod mooncake_hbm_p2p_probe
+```
+
+The next level requires a separately reviewed, controlled NVMe command path,
+content verification, PCIe/ACS/IOMMU evidence, and direct-versus-fallback
+counters. Do not attach that experiment to a mounted production filesystem.
+
+## 6. GDS-style benchmark matrix
 
 After L2 exists, compare the same file, offsets and cache state across:
 

@@ -274,6 +274,7 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
+    --exclude libtransfer_engine.so* \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \

@@ -52,6 +52,13 @@ if(USE_ASCEND_DIRECT)
   add_executable(ssd_direct_hbm_probe
                  ${WORKSPACE}/ssd_direct_hbm_probe.cpp)
   target_link_libraries(ssd_direct_hbm_probe PUBLIC ascendcl)
+
+  add_executable(hbm_p2p_mapping_probe
+                 ${WORKSPACE}/hbm_p2p_mapping_probe.cpp)
+  target_include_directories(hbm_p2p_mapping_probe
+                             PRIVATE ${WORKSPACE}/hbm_p2p_probe)
+  target_link_libraries(hbm_p2p_mapping_probe PUBLIC ascendcl)
+
   find_library(LIBURING_LIBRARY uring)
   find_path(LIBURING_INCLUDE_DIR liburing.h)
   if(LIBURING_LIBRARY AND LIBURING_INCLUDE_DIR)
