@@ -180,22 +180,28 @@ headers and modules into the container.
 ```bash
 cd mooncake-transfer-engine/example/hbm_p2p_probe
 
-# If CONFIG_MODVERSIONS is enabled, point this at the Module.symvers produced
-# by the matching CANN/Ascend driver build so the GPL symbol CRCs are correct.
-make \
-  KDIR=/lib/modules/$(uname -r)/build \
-  ASCEND_SYMVERS=/path/to/cann-driver/Module.symvers
+make KDIR=/lib/modules/$(uname -r)/build
 ```
 
-Search only local installation/build trees when the exact path is unknown:
+The probe does not directly link against `hal_kernel_p2p_get_pages` or
+`hal_kernel_p2p_put_pages`. At module initialization it obtains both exports
+from the already loaded `drv_devmm_host` through `__symbol_get`, holds the
+provider module references while the probe is loaded, and releases them with
+`__symbol_put` on failure or module exit. This avoids requiring a private
+Ascend Driver `Module.symvers`, which is commonly absent from binary driver
+installations.
+
+The matching kernel build tree still needs its own complete `Module.symvers`.
+Check the two runtime lookup APIs before building:
 
 ```bash
-find /usr/local/Ascend /usr/src /lib/modules/$(uname -r) \
-  -name Module.symvers -type f -print 2>/dev/null
+grep -wE '__symbol_get|__symbol_put' \
+  /lib/modules/$(uname -r)/build/Module.symvers
 ```
 
-Use the file from the build that produced the running `drv_devmm_host`, not an
-arbitrary kernel or newer CANN tree.
+Do not pass the kernel's `Module.symvers` through `KBUILD_EXTRA_SYMBOLS`: Kbuild
+already loads it from `KDIR`, and loading it again produces duplicate-export
+warnings. Do not use `KBUILD_MODPOST_WARN=1` or fabricate Ascend CRC entries.
 
 The installed driver already passes the export prerequisite when the following
 symbols are visible:
@@ -214,10 +220,12 @@ test -c /dev/mooncake_hbm_p2p_probe && \
   echo 'PASS: /dev/mooncake_hbm_p2p_probe is ready'
 ```
 
-If `insmod` reports `Unknown symbol`, do not bypass module-version checks.
-Rebuild against the exact host kernel and the matching Ascend
-`Module.symvers`. No network access is required once those local build inputs
-are present.
+If `insmod` reports that either Ascend P2P symbol could not be resolved, verify
+that `drv_devmm_host` is loaded and that the two `__ksymtab` entries are visible
+in `/proc/kallsyms`. Runtime lookup deliberately removes compile-time CRC
+checking for these two vendor functions, so record the loaded driver's path,
+SHA-256 and `srcversion`; the probe still rejects an unexpected page-table ABI
+version before consuming the returned page table.
 
 ### 5.2 Choose the exact NVMe controller BDF
 

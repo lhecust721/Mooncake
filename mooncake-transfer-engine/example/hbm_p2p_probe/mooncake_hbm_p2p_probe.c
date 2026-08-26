@@ -38,10 +38,48 @@ struct p2p_page_table {
     u64 reserved[4];
 };
 
-extern int hal_kernel_p2p_get_pages(
+typedef int (*mooncake_p2p_get_pages_fn)(
     u64 va, u64 len, void (*free_callback)(void *data), void *data,
     struct p2p_page_table **page_table);
-extern int hal_kernel_p2p_put_pages(struct p2p_page_table *page_table);
+typedef int (*mooncake_p2p_put_pages_fn)(
+    struct p2p_page_table *page_table);
+
+static mooncake_p2p_get_pages_fn mooncake_p2p_get_pages;
+static mooncake_p2p_put_pages_fn mooncake_p2p_put_pages;
+
+static void mooncake_release_p2p_symbols(void)
+{
+#ifdef CONFIG_MODULE_UNLOAD
+    if (mooncake_p2p_put_pages != NULL)
+        __symbol_put("hal_kernel_p2p_put_pages");
+    if (mooncake_p2p_get_pages != NULL)
+        __symbol_put("hal_kernel_p2p_get_pages");
+#endif
+    mooncake_p2p_put_pages = NULL;
+    mooncake_p2p_get_pages = NULL;
+}
+
+static int mooncake_resolve_p2p_symbols(void)
+{
+    void *symbol;
+
+    symbol = __symbol_get("hal_kernel_p2p_get_pages");
+    if (symbol == NULL) {
+        pr_err("hal_kernel_p2p_get_pages is not exported by a loaded module\n");
+        return -ENODEV;
+    }
+    mooncake_p2p_get_pages = (mooncake_p2p_get_pages_fn)symbol;
+
+    symbol = __symbol_get("hal_kernel_p2p_put_pages");
+    if (symbol == NULL) {
+        pr_err("hal_kernel_p2p_put_pages is not exported by a loaded module\n");
+        mooncake_release_p2p_symbols();
+        return -ENODEV;
+    }
+    mooncake_p2p_put_pages = (mooncake_p2p_put_pages_fn)symbol;
+    pr_info("resolved Ascend HBM P2P page symbols at runtime\n");
+    return 0;
+}
 
 struct mooncake_hbm_callback_context {
     atomic_t invalidated;
@@ -255,7 +293,7 @@ static long mooncake_hbm_p2p_ioctl(struct file *file, unsigned int command,
         return -ENOMEM;
     atomic_set(&callback_context->invalidated, 0);
 
-    status = hal_kernel_p2p_get_pages(
+    status = mooncake_p2p_get_pages(
         request.hbm_va, request.hbm_size, mooncake_hbm_free_callback,
         callback_context, &page_table);
     request.get_pages_status = status;
@@ -275,7 +313,7 @@ static long mooncake_hbm_p2p_ioctl(struct file *file, unsigned int command,
     }
 
     if (page_table != NULL)
-        request.put_pages_status = hal_kernel_p2p_put_pages(page_table);
+        request.put_pages_status = mooncake_p2p_put_pages(page_table);
     else
         request.put_pages_status = -ENODATA;
     request.invalidated = atomic_read(&callback_context->invalidated) != 0;
@@ -300,12 +338,22 @@ static struct miscdevice mooncake_hbm_p2p_device = {
 
 static int __init mooncake_hbm_p2p_init(void)
 {
-    return misc_register(&mooncake_hbm_p2p_device);
+    int status;
+
+    status = mooncake_resolve_p2p_symbols();
+    if (status != 0)
+        return status;
+
+    status = misc_register(&mooncake_hbm_p2p_device);
+    if (status != 0)
+        mooncake_release_p2p_symbols();
+    return status;
 }
 
 static void __exit mooncake_hbm_p2p_exit(void)
 {
     misc_deregister(&mooncake_hbm_p2p_device);
+    mooncake_release_p2p_symbols();
 }
 
 module_init(mooncake_hbm_p2p_init);

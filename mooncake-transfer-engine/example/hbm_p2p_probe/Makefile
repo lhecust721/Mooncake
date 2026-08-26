@@ -6,11 +6,6 @@ obj-m += mooncake_hbm_p2p_probe.o
 else
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
-KBUILD_ARGS :=
-ifneq ($(strip $(ASCEND_SYMVERS)),)
-KBUILD_ARGS += KBUILD_EXTRA_SYMBOLS=$(abspath $(ASCEND_SYMVERS))
-endif
-
 .PHONY: all clean
 
 all:
@@ -19,11 +14,19 @@ all:
 		echo "Run on the host or mount the exact host kernel headers."; \
 		exit 2; \
 	}
-	@if [ -n "$(ASCEND_SYMVERS)" ] && [ ! -f "$(ASCEND_SYMVERS)" ]; then \
-		echo "FAIL: ASCEND_SYMVERS not found: $(ASCEND_SYMVERS)"; \
+	@test -f "$(KDIR)/Module.symvers" || { \
+		echo "FAIL: kernel Module.symvers not found: $(KDIR)/Module.symvers"; \
 		exit 2; \
-	fi
-	$(MAKE) -C "$(KDIR)" M="$(CURDIR)" $(KBUILD_ARGS) modules
+	}
+	@grep -qw '__symbol_get' "$(KDIR)/Module.symvers" || { \
+		echo "FAIL: __symbol_get is not exported by the target kernel"; \
+		exit 2; \
+	}
+	@grep -qw '__symbol_put' "$(KDIR)/Module.symvers" || { \
+		echo "FAIL: __symbol_put is not exported by the target kernel"; \
+		exit 2; \
+	}
+	$(MAKE) -C "$(KDIR)" M="$(CURDIR)" modules
 
 clean:
 	@test -d "$(KDIR)" || exit 0
