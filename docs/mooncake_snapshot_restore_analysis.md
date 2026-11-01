@@ -1,0 +1,228 @@
+# Mooncake Master Snapshot/Restore 与 KV Pool 复用问题分析
+
+- 日期：2026-11-01
+- 版本：`mooncake-transfer-engine-npu 0.3.12.post1`
+- 场景：vLLM-Ascend + `AscendStoreConnector`（Mooncake KV pool，非 PD 的 `MooncakeConnector`）
+- Master 容器：`lihong-vllm-ascend_0.30.0rc2`
+- vLLM 容器：`lihong-mooncakessdoffload`
+
+## 1. 结论摘要
+
+1. 当前 0.3.12.post1 的 snapshot **确实保存了 key 元数据**（`metadata` 中 `shards` 非空，包含 key、size、replica 等信息）。
+2. 但 restore 的 `ApplySnapshotState` 会清理“lease 在**恢复时刻**已过期且未 soft-pin”的对象。因此：
+   - KV pool 中 `PutEnd` 后未被再次访问的空闲 key，lease 正常情况下就是过期状态；
+   - 这类 key 在 master 重启恢复时会被删除；
+   - 即使短暂有读取续租，只要停机时间超过 lease 剩余时间，恢复时仍会被删除。
+3. 因此，**当前 snapshot 元数据恢复不是 KV pool 的持久化机制**。它面向的是 master 快速 HA 恢复：client/segment/DRAM 数据还活着、活跃对象 lease 仍有效时，把 master 的段/索引/任务元数据接回来。
+4. 若需要 KV pool 跨 master 重启复用，需要额外方案：
+   - soft pin（0.3.12 可用但当前 vLLM-Ascend 未启用，且有 TTL/淘汰限制）；
+   - 修改 restore 清理策略（或增加配置开关）；
+   - client 侧重注册/重建索引；
+   - 评估新版本（v0.3.13/main）的 snapshot/oplog HA 机制。
+
+## 2. Mooncake 写入与 lease 语义
+
+Mooncake 的写入是两阶段：
+
+- `PutStart`：master 分配 replica（DRAM buffer），状态 `PROCESSING`，返回 buffer 描述符；client 写入 KV 数据。
+- `PutEnd`：client 写完后通知 master；master 将 replica 标记为 `COMPLETE`，清理 processing 状态、结算 quota，并调用：
+
+```cpp
+// mooncake-store/src/master_service.cpp:2905 (v0.3.12.post1)
+metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+```
+
+源码注释说明：
+
+```cpp
+// 1. Set lease timeout to now, indicating that the object has no lease
+//    at beginning.
+// 2. If this object has soft pin enabled, set it to be soft pinned.
+```
+
+结论：
+
+- `lease` 不是对象数据的生命周期 TTL，而是“读保护租约”；
+- `PutEnd` 时没有读者，所以把 lease 设为 now（表示当前无租约）；
+- 后续 `Get` / `ExistKey` 才会重新授予 `now + default_kv_lease_ttl`，保护读取期间不被淘汰；
+- 空闲对象 lease 过期后不会立即删除，仍可被后续 Get 命中，只有在内存水位/淘汰策略下才可能被 evict。
+
+## 3. Restore 清理逻辑与根因
+
+恢复时 `RestoreState()` 先取当前时间 `now`，再调用 `ApplySnapshotState(now)`。清理逻辑使用**恢复时刻**的 `now`：
+
+```cpp
+// mooncake-store/src/master_service.cpp:6051-6055 (v0.3.12.post1)
+if (it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE) ||
+    (it->second.IsLeaseExpired(cleanup_now) &&
+     !it->second.IsSoftPinned(cleanup_now))) {
+    VLOG(1) << "clear metadata key=" << it->first;
+    it = EraseMetadata(...);
+}
+```
+
+即：
+
+- replica 不完整 → 删除；
+- replica 完整，但 lease 在恢复时刻已过期，且未 soft-pin → 删除；
+- 只有恢复时刻 lease 仍有效，或 soft-pin 未过期（0.3.12）→ 保留。
+
+由于 KV pool 对象在 `PutEnd` 后 lease 就是过期状态，restore 会清掉这些空闲 key。这不是快照编码问题，而是恢复策略与 KV pool 复用场景的冲突。
+
+## 4. 实测过程与证据
+
+测试配置（相对原配置的变更）：
+
+```bash
+export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data1/mooncake_snapshots
+
+nohup mooncake_master \
+    --port 50388 \
+    --metrics_port 19004 \
+    --eviction_high_watermark_ratio 0.9 \
+    --eviction_ratio 0.2 \
+    --enable-snapshot=true \
+    --snapshot-interval-seconds=15 \
+    --snapshot-retention-count=10 \
+    --snapshot-object-store-type=local \
+    --enable-snapshot-restore=true \
+    --client_ttl 60 \
+    --enable_offload=false \
+    --default_kv_lease_ttl 600000 > master.log 2>&1 &
+```
+
+| 参数 | 原值 | 测试值 | 说明 |
+|---|---:|---:|---|
+| `--default_kv_lease_ttl` | 30000 (30s) | 600000 (10min) | 仅用于验证 lease 在恢复时仍有效的情况 |
+| `--snapshot-interval-seconds` | 60 | 15 | 加快测试 |
+| `--snapshot-retention-count` | 3 | 10 | 保留测试快照 |
+
+### 4.1 失败：快照有 key，但 restore 后 key 被清
+
+- 推理后 master：`master_key_count=1`，`master_allocated_bytes=12582912`
+- 快照 `20261101_154154_541`：
+  - `metadata` 341B，解压后包含 key；
+  - key 的 `lease_timeout = 1793547693218`（约 15:41:33.218，即 PutEnd 时刻，已过期）。
+- 重启后：
+
+```text
+[Restore] Total allocated size after restore: 0
+master_key_count 0
+master_allocated_bytes 0
+```
+
+说明：snapshot 中有 key，但 restore 时被清理。
+
+### 4.2 成功：恢复前续租，restore 保留 key
+
+对 key 调用 `is_exist()`（触发 `ExistKey`，会刷新 lease）后：
+
+- lease 更新为 `16:01:49.125`
+- 快照 `20261101_155215_029` 保存了新的 lease
+- 立即重启 master（不带 skip-cleanup）：
+
+```text
+[Restore] Total allocated size after restore: 12582912
+[Restore] Successfully restored state from snapshot: 20261101_155215_029
+
+master_key_count 1
+master_allocated_bytes 12582912
+```
+
+说明：lease 在恢复时刻仍有效时，key 元数据可以恢复。
+
+### 4.3 诊断：跳过清理可恢复过期 key
+
+设置：
+
+```bash
+MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP=1
+```
+
+重启后：
+
+```text
+[Restore] Total allocated size after restore: 12582912
+master_key_count 1
+```
+
+说明：清理逻辑确实是 key 被删除的直接原因。该环境变量是测试开关，会跳过所有清理，不建议生产直接使用。
+
+### 4.4 证据文件
+
+- `/data1/mooncake_snapshots/evidence_restore_ok_20261101_155215_029`
+- `/workspace/master.log.restore_success_*`
+- `/workspace/master.log.run1_*`、`master.log.run2_*`、`master.log.run3_*`、`master.log.run4_*`
+- 当前 master metrics：`master_key_count=1`，`master_allocated_bytes=12582912`
+
+## 5. Snapshot restore 到底恢复什么
+
+它恢复的是 **master 的元数据状态**，不是 KV 数据本身：
+
+- segment 注册信息、容量、allocator/已分配状态；
+- replica 元数据、`replica_next_id`、discarded replicas；
+- 恢复时刻仍有效 lease 的对象，或（0.3.12）soft-pinned 且未过期的对象；
+- task manager（offload/promotion/copy/move 等任务）；
+- tenant quota policy、evicted-key FIFO/catalog 等。
+
+注意：**KV 实际数据不在 snapshot 中**。snapshot 只包含对象元数据与 replicas 描述，真正的 KV 字节位于 client 的 DRAM segment。因此：
+
+- 只重启 master、vLLM/client 不重启：DRAM 数据还在，恢复活跃对象元数据后有复用价值；
+- 如果 vLLM 也重启：数据本身已丢失，恢复全部 key 元数据也没有意义，甚至会产生悬空元数据；
+- 恢复策略因此保守地丢弃“lease 过期且未 pin”的空闲对象。
+
+## 6. 对用户疑问的澄清
+
+### 6.1 这是 KV pool，不是 PD 传输
+
+正确。当前是 `AscendStoreConnector` + Mooncake KV pool，用于跨请求、跨实例 prefill 复用；不是 `MooncakeConnector` 的 PD KV 传输。之前把两者混在一起的分析已修正。
+
+### 6.2 `PutEnd` 为什么把 lease 设为 now
+
+因为 lease 是读保护租约，不是数据 TTL。PutEnd 后没有读者，所以 lease 置为 now；后续 Get/ExistKey 才续租。空闲对象 lease 过期是正常状态。
+
+### 6.3 `lease TTL > 快照间隔 + 重启耗时` 不成立
+
+- 对空闲 KV pool 对象，没有 Get/ExistKey 就不会续租，lease TTL 设多大都没用；
+- cleanup 使用恢复时刻的 now，不是快照时刻。即使快照时 lease 有效，只要停机时间超过剩余 lease，恢复时仍会被清；
+- 重启时间不可控，因此 lease 不能作为持久化手段；
+- 实测：`default_kv_lease_ttl=600000` 但不 touch key，restore 后仍为 `allocated=0 / key=0`；
+- 30s lease + 60s 快照间隔不是根因。
+
+## 7. 可行方案
+
+### 方案 A：修改 restore 清理策略（推荐用于 KV pool 持久化）
+
+- 对 complete 对象不要仅因 lease 过期就删除；
+- 或增加显式配置开关（例如 `snapshot_restore_keep_expired_keys`），KV pool 场景默认保留；
+- 需要额外处理 client/segment 存活校验与脏元数据风险；
+- 当前可用 `MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP=1` 验证，但不建议生产直接使用。
+
+### 方案 B：soft pin（0.3.12 可用，需改 client）
+
+- Put 时设置 `ReplicateConfig.with_soft_pin=True`；
+- 调大 `--default_kv_soft_pin_ttl` 覆盖最大预期停机窗口；
+- restore 时 0.3.12 的 `!IsSoftPinned` 例外会保留该对象；
+- 限制：仍是有限 TTL；`allow_evict_soft_pinned_objects=1` 时高水位仍可能淘汰；
+- 当前 vLLM-Ascend `mooncake_backend.py:_build_replicate_config()` 未设置 `with_soft_pin`，需要 patch。
+
+### 方案 C：客户端重新注册/重建索引
+
+- master 恢复 segment 后，由 client 启动时重新上报/校验 key；
+- 需要修改 vLLM-Ascend connector；
+- 不依赖 lease 过期策略，但实现复杂度较高。
+
+### 方案 D：评估新版本
+
+- v0.3.13 的 `ApplySnapshotState` 清理条件中已没有 `!IsSoftPinned` 例外（只剩 `IsLeaseExpired(cleanup_now)`），不能指望升级自动解决；
+- main 分支已重构 snapshot/oplog HA，需单独评估其对象恢复语义。
+
+## 8. 建议
+
+1. 如果目标是验证 master 元数据恢复：当前行为符合“只恢复活跃/有效对象”的设计，测试时应保证 key 在恢复时刻 lease 有效（例如恢复前 `ExistKey` 续租），或使用 skip-cleanup 做诊断。
+2. 如果目标是 KV pool 跨重启复用：不要把 `default_kv_lease_ttl` 当持久化 TTL；优先评估修改 restore 清理策略或客户端重注册，soft pin 可作为过渡方案。
+3. 生产环境不建议使用 `MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP=1`，它只是验证手段。
+4. 如需继续分析，建议下一步：
+   - 验证 soft pin 在 0.3.12 下跨重启恢复的完整链路；
+   - 设计 restore 保留过期 key 的开关及 client/segment 校验逻辑；
+   - 对比 v0.3.13/main 的 snapshot/oplog HA 行为。
