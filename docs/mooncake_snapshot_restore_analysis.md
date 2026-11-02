@@ -385,7 +385,7 @@ master 重建 key 元数据
 
 - `docs/logs/master_resetafter.log`
 - `docs/logs/master_resetbefor.log`
-- `docs/logs/mooncake_SSD.log`
+- `docs/logs/mooncake_SSD.log.gz`（gzip 压缩；原始文件约 54MB，受 GitHub API 单文件限制，使用 `gzip -d mooncake_SSD.log.gz` 解压）
 - `docs/logs/mooncake_qwen_DRAM.log`
 - `docs/logs/mooncake.log`（最新 master 日志 `/workspace/mooncake.log`，用于 2026-11-02 的 SSD 恢复验证）
 - `docs/logs/vllm_prefill.log`（vllm 容器 `/workspace/vllm_prefill.log`）
